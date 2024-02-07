@@ -4,6 +4,7 @@
 * Type definition for esp-now communication (use in sender and receiver)
 */
 typedef struct{
+  int datapointID; //group values to one datapoint
   char id[50]; //sensor id
   char key[20]; //val key (e.g. temperature, pressure)
   char sensorType[50]; //which type of sensor
