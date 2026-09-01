@@ -36,16 +36,21 @@
 // --------------------------------------------------------------------------
 // Thread-Netzkonfiguration (Operational Dataset)
 //
-// WICHTIG: Muss identisch mit den THREAD_*-Werten der ESP-BME-Knoten sein
-// (bzw. dem Netz des Border Routers, falls vorhanden). Trage hier die Werte
-// deines Thread-Netzwerks ein.
+// Dieses Gerät FORMST das Thread-Netz (Leader-Rolle, wie der offizielle
+// "LeaderNode" Example) und vergibt dabei frische Timestamps + Mesh-Local-
+// Prefix via initNew(). Der ESP-BME-Knoten tritt mit NUR dem Network Key
+// bei (Client-Pattern, siehe sensor_client Example).
+//
+// Beim ersten Start wird das Netz mit diesen festen Werten angelegt. Damit
+// der Knoten sich zuordnet, müssen Network Key (und idealerweise Name/PAN/
+// Kanal) in beiden Sketches identisch sein.
 // --------------------------------------------------------------------------
-static const char     THREAD_NETWORK_NAME[] = "OpenThread-XXXX";
-static const uint16_t THREAD_PAN_ID         = 0x1234;
+static const char     THREAD_NETWORK_NAME[] = "Wetter-Thread";
+static const uint16_t THREAD_PAN_ID         = 0x2345;
 static const uint8_t  THREAD_CHANNEL        = 15;
-static const uint8_t  THREAD_EXT_PAN_ID[8]  = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-static const uint8_t  THREAD_NETWORK_KEY[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-                                                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+static const uint8_t  THREAD_EXT_PAN_ID[8]  = {0xDE,0xAD,0xBE,0xEF,0x00,0x00,0x01,0x02};
+static const uint8_t  THREAD_NETWORK_KEY[16] = {0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x07,0x18,
+                                                0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90};
 
 // --------------------------------------------------------------------------
 // Nodes (Thread-Sender), die abgefragt werden sollen.
@@ -61,7 +66,7 @@ struct NodeConfig {
 };
 
 static NodeConfig nodes[] = {
-  {"wetter1", "fdde:ad00:beef:0000:0000:0000:0000:0001"},  // TODO: EID des Knotens eintragen
+  {"wetter1", "fdae:7cba:5e6e:8852:e8e8:8f19:8183:86d9"},  // ESP-BME (H2)
   // {"wetter2", "fdde:ad00:beef:0000:0000:0000:0000:0002"},  // weiterer Knoten
 };
 #define NODE_COUNT (sizeof(nodes) / sizeof(nodes[0]))
@@ -118,21 +123,32 @@ static void sendErrorToPi(const char *src, const char *err) {
 static bool joinNetwork() {
   OThread.begin(false);
 
-  DataSet ds;
-  ds.setNetworkName(THREAD_NETWORK_NAME);
-  ds.setPanId(THREAD_PAN_ID);
-  ds.setChannel(THREAD_CHANNEL);
-  ds.setExtendedPanId(THREAD_EXT_PAN_ID);
-  ds.setNetworkKey(THREAD_NETWORK_KEY);
+  // Dieses Gerät FORMST das Thread-Netz (Leader-Rolle). WICHTIG: initNew()
+  // erzeugt ein frisches Dataset (Timestamps + Mesh-Local-Prefix). Das wird
+  // in NVS persistiert und darf daher nur EINMAL beim ersten Start passieren,
+  // sonst ändert sich das Mesh-Local-Prefix bei jedem Reboot und damit auch
+  // die EID aller Knoten. Nach einem Reboot wird das gespeicherte Dataset
+  // übernommen und das Netz identisch wiederhergestellt.
+  if (!OThread.hasActiveDataset()) {
+    DataSet ds;
+    ds.initNew();
+    ds.setNetworkName(THREAD_NETWORK_NAME);
+    ds.setPanId(THREAD_PAN_ID);
+    ds.setChannel(THREAD_CHANNEL);
+    ds.setExtendedPanId(THREAD_EXT_PAN_ID);
+    ds.setNetworkKey(THREAD_NETWORK_KEY);
+    OThread.commitDataSet(ds);
+  } else {
+    Serial.println("Wiederverwende gespeichertes Dataset aus NVS.");
+  }
 
-  OThread.commitDataSet(ds);
   OThread.networkInterfaceUp();
   OThread.start();
 
   Serial.print("Warte auf Thread-Verbindung");
   uint32_t start = millis();
   while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    if (millis() - start > 45000) {
+    if (millis() - start > 60000) {
       Serial.println("\nTimeout - keine Thread-Verbindung.");
       return false;
     }
@@ -143,6 +159,7 @@ static bool joinNetwork() {
 
   Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
   OThread.otPrintNetworkInformation(Serial);
+  Serial.printf("Mesh-Local EID (Leader): %s\n", OThread.getMeshLocalEid().toString().c_str());
   return true;
 }
 
@@ -188,6 +205,15 @@ void setup() {
 
   coap.setTimeout(COAP_TIMEOUT_MS);
 
+  // Kommittiertes Dataset zur Kontrolle ausgeben
+  Serial.printf("Dataset: Name=%s PAN=0x%04X Ch=%u ActiveDs=%s\n",
+                OThread.getNetworkName().c_str(), (int)OThread.getPanId(), (int)OThread.getChannel(),
+                OThread.hasActiveDataset() ? "ja" : "nein");
+  const uint8_t *xp = OThread.getExtendedPanId();
+  Serial.printf("ExtPAN: %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                xp[0],xp[1],xp[2],xp[3],xp[4],xp[5],xp[6],xp[7]);
+  Serial.printf("EUI64 : %s\n", OThread.getEui64().c_str());
+
   Serial.printf("Bereit. Pollinger %u Node(s) alle %d ms über UART0 (%d baud) an den Pi.\n",
                 NODE_COUNT, (int)POLL_INTERVAL_MS, (int)PI_BAUD);
 }
@@ -195,6 +221,8 @@ void setup() {
 // --------------------------------------------------------------------------
 void loop() {
   static uint32_t lastRound = 0;
+  static uint32_t lastStatus = 0;
+  static const char *lastRole = "";
 
   // Nur poller, wenn Thread aktiv ist
   if (OThread.otGetDeviceRole() >= OT_ROLE_CHILD) {
@@ -219,6 +247,14 @@ void loop() {
       }
     }
   } else {
+    // Thread-Zustand im Hintergrund melden, solange noch keine Rolle besteht
+    const char *role = OThread.otGetStringDeviceRole();
+    uint32_t now = millis();
+    if (strcmp(role, lastRole) != 0 || now - lastStatus > 10000) {
+      lastStatus = now;
+      lastRole = role;
+      Serial.printf("Rolle: %s\n", role);
+    }
     delay(500);
   }
 
