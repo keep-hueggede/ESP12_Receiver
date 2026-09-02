@@ -4,7 +4,7 @@
  * ESP32-C6 (SuperMini): tritt demselben Thread-Netzwerk bei wie die
  * ESP-BME-Wetterknoten und fragt deren CoAP-Ressource /weather/all
  * ab. Die Messwerte werden als JSON-Zeilen an den Raspberry Pi
- * übergeben (verdrahtet, UART0: GPIO16 TX / GPIO17 RX, 115200 baud).
+ * übergeben (verdrahtet, UART0: GPIO24 TX / GPIO23 RX, 115200 baud).
  *
  * Übertragung:    Thread (802.15.4) + CoAP (UDP, 5683)
  * Rolle:          CoAP-Client / Thread-Router (FTD), kein OTBR nötig
@@ -23,15 +23,15 @@
 // --------------------------------------------------------------------------
 // Schnittstelle zum Raspberry Pi (UART0, 3-Leiter: TX, RX, GND)
 // --------------------------------------------------------------------------
-// ESP32-C6 SuperMini: UART0 TX = GPIO16, RX = GPIO17 (Pads "TX"/"RX").
+// ESP32-C6: UART-TX/RX auf den Board-Standardpins GPIO24 (TX) / GPIO23 (RX).
 // Verdrahtung:
-//   C6 GPIO16 (TX)  -> Pi GPIO15 (RX, pin 10)
-//   C6 GPIO17 (RX)  -> Pi GPIO14 (TX, pin 8)
+//   C6 GPIO24 (TX)  -> Pi GPIO15 (RX, pin 10)
+//   C6 GPIO23 (RX)  -> Pi GPIO14 (TX, pin 8)
 //   C6 GND          -> Pi GND
 #define PI_SERIAL    Serial0
 #define PI_BAUD      115200
-#define PI_TX_PIN    16     // GPIO16 -> Pi RX
-#define PI_RX_PIN    17     // GPIO17 <- Pi TX
+#define PI_TX_PIN    24     // GPIO24 -> Pi RX
+#define PI_RX_PIN    23     // GPIO23 <- Pi TX
 
 // --------------------------------------------------------------------------
 // Thread-Netzkonfiguration (Operational Dataset)
