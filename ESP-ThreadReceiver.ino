@@ -1,24 +1,23 @@
 /*******************************************
- * ESP-ThreadReceiver - Thread + CoAP Empfänger
+ * ESP-ThreadReceiver-LoRa - LoRa Empfänger (Zentrale)
  *
- * ESP32-C6 (SuperMini): tritt demselben Thread-Netzwerk bei wie die
- * ESP-BME-Wetterknoten und fragt deren CoAP-Ressource /weather/all
- * ab. Die Messwerte werden als JSON-Zeilen an den Raspberry Pi
- * übergeben (verdrahtet, UART0: GPIO16 TX / GPIO17 RX, 115200 baud).
+ * ESP32-C6 (SuperMini) mit LoRa-Modul (SX127x, SPI): empfängt die
+ * LoRa-Pakete der Waldknoten (ESP-BME-LoRa) und übergibt die
+ * Messwerte als JSON-Zeilen an den Raspberry Pi
+ * (verdrahtet, UART0: GPIO16 TX / GPIO17 RX, 115200 baud).
  *
- * Übertragung:    Thread (802.15.4) + CoAP (UDP, 5683)
- * Rolle:          CoAP-Client / Thread-Router (FTD), kein OTBR nötig
- * Ausgabe:        JSON-Zeile je Node und Abfrage (siehe sendToPi)
+ * Übertragung:    LoRa (SPI, SX127x) @ 868 MHz, SF12
+ * Rolle:          LoRa-Empfänger, einmal dauerhaft empfangsbereit
+ * Ausgabe:        JSON-Zeile je Node und Paket (siehe sendToPi)
  *
- * Erweiterung:    Weitere Thread-Sender werden einfach als neuer Eintrag
- *                 im Array `nodes[]` ergänzt (Name + IPv6-Adresse).
+ * Erweiterung:    Weitere Waldknoten brauchen hier NICHTS geändert zu
+ *                 werden - jeder Sender trägt seinen Namen im Paket.
  *
  * Benötigt:       Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module",
- *                 CDCOnBoot = Enabled (Serial = USB-CDC am COM-Port).
+ *                 CDCOnBoot = Enabled, RadioLib-Bibliothek.
  *******************************************/
 #include <Arduino.h>
-#include <OThread.h>
-#include <OThreadCoAP.h>
+#include <RadioLib.h>
 
 // --------------------------------------------------------------------------
 // Schnittstelle zum Raspberry Pi (UART0, 3-Leiter: TX, RX, GND)
@@ -34,51 +33,24 @@
 #define PI_RX_PIN    17     // GPIO17 <- Pi TX
 
 // --------------------------------------------------------------------------
-// Thread-Netzkonfiguration (Operational Dataset)
-//
-// Dieses Gerät FORMST das Thread-Netz (Leader-Rolle, wie der offizielle
-// "LeaderNode" Example) und vergibt dabei frische Timestamps + Mesh-Local-
-// Prefix via initNew(). Der ESP-BME-Knoten tritt mit NUR dem Network Key
-// bei (Client-Pattern, siehe sensor_client Example).
-//
-// Beim ersten Start wird das Netz mit diesen festen Werten angelegt. Damit
-// der Knoten sich zuordnet, müssen Network Key (und idealerweise Name/PAN/
-// Kanal) in beiden Sketches identisch sein.
+// LoRa-Modul am SPI-Bus des ESP32-C6 (Verdrahtung anpassen!)
 // --------------------------------------------------------------------------
-static const char     THREAD_NETWORK_NAME[] = "Wetter-Thread";
-static const uint16_t THREAD_PAN_ID         = 0x2345;
-static const uint8_t  THREAD_CHANNEL        = 15;
-static const uint8_t  THREAD_EXT_PAN_ID[8]  = {0xDE,0xAD,0xBE,0xEF,0x00,0x00,0x01,0x02};
-static const uint8_t  THREAD_NETWORK_KEY[16] = {0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x07,0x18,
-                                                0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90};
+#define LORA_SS   18       // NSS/CS  -> GPIO18 (Default SS des C6)
+#define LORA_RST  10       // Reset   -> GPIO10 (frei)
+#define LORA_DIO0 11       // DIO0    -> GPIO11 (frei, Interrupt für RX)
+// SCK=GPIO21, MOSI=GPIO19, MISO=GPIO20 (Default-SPI des C6)
 
 // --------------------------------------------------------------------------
-// Nodes (Thread-Sender), die abgefragt werden sollen.
-//
-// Jede Zeile = ein Gerät. Die IPv6-Adresse ist die Thread-EID (Mesh-Local
-// EID) des jeweiligen Knotens - ausgegeben von dessen otPrintNetworkInformation
-// ("MLEID" bzw. die fdXX:...-Adresse unter IPv6) bzw. `ot ipaddr`.
-// Neues Gerät anlegen = neue Zeile im Array, fertig.
+// LoRa-Funkparameter (müssen auf Sender und Empfänger identisch sein!)
 // --------------------------------------------------------------------------
-struct NodeConfig {
-  const char *name;  // Anzeigename, wird als "src" an den Pi gesendet
-  const char *eid;   // IPv6-Adresse des Knotens (Thread-EID)
-};
-
-static NodeConfig nodes[] = {
-  {"wetter1", "fdae:7cba:5e6e:8852:e8e8:8f19:8183:86d9"},  // ESP-BME (H2)
-  // {"wetter2", "fdde:ad00:beef:0000:0000:0000:0000:0002"},  // weiterer Knoten
-};
-#define NODE_COUNT (sizeof(nodes) / sizeof(nodes[0]))
-
-// --------------------------------------------------------------------------
-// Abfrage-Timing
-// --------------------------------------------------------------------------
-#define POLL_INTERVAL_MS  5000   // Abstand zwischen zwei Abfrage-Runden
-#define COAP_TIMEOUT_MS   3000   // Timeout je Node-Abfrage
-#define MAX_FAILURES      3      // Fehlversuche, bis ein Node als offline markiert wird
-
-static const char *WEATHER_PATH = "weather/all";
+#define LORA_FREQ_MHZ   868.1F   // EU-LoRa ISM-Band, Kanal 1
+#define LORA_SF         12       // Spreading Factor 12 = maximale Reichweite
+#define LORA_BW         125.0F   // Bandbreite 125 kHz
+#define LORA_CR         8        // Coding Rate 4/8 (mehr Redundanz, bessere Link-Budget)
+#define LORA_SYNC       0x12     // Sync-Word (Standard LoRa)
+#define LORA_POWER      20       // Sendeleistung (auf Empfänger nur für ACK-spätere Nutzung)
+#define LORA_PREAMBLE   8        // Preamble-Symbole
+#define LORA_RX_TIMEOUT 0        // RadioLib: 0 = Endlos-Empfang
 
 // --------------------------------------------------------------------------
 // RGB-LED am SuperMini (GPIO8) beim Start abschalten
@@ -86,108 +58,111 @@ static const char *WEATHER_PATH = "weather/all";
 #define LED_PIN 8
 
 // --------------------------------------------------------------------------
-// OpenThread / CoAP
+// Funk
 // --------------------------------------------------------------------------
-OThreadCoAPClient coap;
-
-// Letzter bekannter Status je Node (für Offline-Erkennung)
-static struct {
-  uint32_t lastOkMs;   // millis() des letzten erfolgreichen Abrufs
-  uint32_t failures;   // aufeinanderfolgende Fehlversuche
-} nodeState[NODE_COUNT];
+SX1278 radio = new Module(LORA_SS, LORA_DIO0, LORA_RST, RADIOLIB_NC);
 
 // --------------------------------------------------------------------------
-// JSON-Zeile an den Raspberry Pi senden. Erwartet wird ein fertiges
-// JSON-Objekt OHNE äußere Klammern, z. B.:
-//   "temp":21.5,"pressure":1013.2,...
+// JSON-Zeile an den Raspberry Pi senden. body ist das fertige JSON-Objekt,
+// z. B. {"temp":21.5,...}. src ist der Knotenname aus dem LoRa-Paket.
 // --------------------------------------------------------------------------
 static void sendToPi(const char *src, const char *body) {
   PI_SERIAL.print("{\"src\":\"");
   PI_SERIAL.print(src);
-  PI_SERIAL.print("\",");
+  PI_SERIAL.print("\",\"data\":");
   PI_SERIAL.print(body);
   PI_SERIAL.println("}");
+  PI_SERIAL.flush();
 }
 
-static void sendErrorToPi(const char *src, const char *err) {
-  PI_SERIAL.print("{\"src\":\"");
-  PI_SERIAL.print(src);
-  PI_SERIAL.print("\",\"error\":\"");
-  PI_SERIAL.print(err);
+static void sendSysToPi(const char *msg) {
+  PI_SERIAL.print("{\"sys\":\"");
+  PI_SERIAL.print(msg);
   PI_SERIAL.println("\"}");
+  PI_SERIAL.flush();
 }
 
 // --------------------------------------------------------------------------
-// Thread-Netz beitreten / formen (Dataset-basiert)
+// Interrupt-Handler: meldet ankommende LoRa-Pakete
 // --------------------------------------------------------------------------
-static bool joinNetwork() {
-  OThread.begin(false);
+static volatile bool rxFlag = false;
 
-  // Dieses Gerät FORMST das Thread-Netz (Leader-Rolle). WICHTIG: initNew()
-  // erzeugt ein frisches Dataset (Timestamps + Mesh-Local-Prefix). Das wird
-  // in NVS persistiert und darf daher nur EINMAL beim ersten Start passieren,
-  // sonst ändert sich das Mesh-Local-Prefix bei jedem Reboot und damit auch
-  // die EID aller Knoten. Nach einem Reboot wird das gespeicherte Dataset
-  // übernommen und das Netz identisch wiederhergestellt.
-  if (!OThread.hasActiveDataset()) {
-    DataSet ds;
-    ds.initNew();
-    ds.setNetworkName(THREAD_NETWORK_NAME);
-    ds.setPanId(THREAD_PAN_ID);
-    ds.setChannel(THREAD_CHANNEL);
-    ds.setExtendedPanId(THREAD_EXT_PAN_ID);
-    ds.setNetworkKey(THREAD_NETWORK_KEY);
-    OThread.commitDataSet(ds);
-  } else {
-    Serial.println("Wiederverwende gespeichertes Dataset aus NVS.");
+static void onRxPkt() {
+  rxFlag = true;
+}
+
+// --------------------------------------------------------------------------
+// LoRa-Empfänger initialisieren und in den Endlos-Empfang wechseln
+// --------------------------------------------------------------------------
+static bool initLora() {
+  Serial.println("Initialisiere LoRa-Modul...");
+  int state = radio.begin(LORA_FREQ_MHZ, LORA_BW, LORA_SF, LORA_CR,
+                          LORA_SYNC, LORA_POWER, LORA_PREAMBLE);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa-Fehler bei begin(): %d. Verdrahtung prüfen!\n", state);
+    return false;
   }
 
-  OThread.networkInterfaceUp();
-  OThread.start();
-
-  Serial.print("Warte auf Thread-Verbindung");
-  uint32_t start = millis();
-  while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    if (millis() - start > 60000) {
-      Serial.println("\nTimeout - keine Thread-Verbindung.");
-      return false;
-    }
-    Serial.print('.');
-    delay(200);
+  // Empfangsbereit: DIO0-Interrupt beim Start eines gültigen Pakets
+  radio.setPacketReceivedAction(onRxPkt);
+  state = radio.startReceive(LORA_RX_TIMEOUT);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa-Fehler bei startReceive(): %d\n", state);
+    return false;
   }
-  Serial.println();
 
-  Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
-  OThread.otPrintNetworkInformation(Serial);
-  Serial.printf("Mesh-Local EID (Leader): %s\n", OThread.getMeshLocalEid().toString().c_str());
+  Serial.printf("LoRa empfangsbereit: %.1f MHz, SF%d, BW%.0f kHz, CR 4/%d\n",
+                LORA_FREQ_MHZ, (int)LORA_SF, LORA_BW, (int)LORA_CR);
   return true;
 }
 
 // --------------------------------------------------------------------------
-// Einen Node per CoAP abfragen und Antwort als JSON-Body liefern.
-// Rückgabe: 0 = Erfolg, <0 = CoAP-Fehler (siehe OT_COAP_ERROR_*)
+// Ein empfangenes Paket auswerten und an den Pi weiterreichen.
+// Paketformat vom Waldknoten: "<Knotenname> <JSON>"
 // --------------------------------------------------------------------------
-static int fetchNode(const NodeConfig *node, char *out, size_t outLen) {
-  int code = coap.GET(node->eid, WEATHER_PATH);
-  if (code <= 0) {
-    return code;  // negativer OT_COAP_ERROR_*
+static void processPacket() {
+  rxFlag = false;
+
+  size_t len = radio.getPacketLength();
+  if (len == 0 || len > 255) {
+    Serial.println("Ungültige Paketlänge.");
+    radio.startReceive(LORA_RX_TIMEOUT);
+    return;
   }
-  String payload = coap.getString();
-  if (payload.length() == 0) {
-    return -2;  // leere Antwort
+
+  char buf[256];
+  int state = radio.readData((uint8_t *)buf, sizeof(buf));
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("Empfangsfehler: %d\n", state);
+    radio.startReceive(LORA_RX_TIMEOUT);
+    return;
   }
-  size_t n = payload.length();
-  if (n > outLen - 1) n = outLen - 1;
-  memcpy(out, payload.c_str(), n);
-  out[n] = '\0';
-  return 0;
+
+  buf[len] = '\0';  // readData liefert keinen Null-Terminator
+
+  // Knotenname und JSON trennen (Leerzeichen als Trennzeichen)
+  char *sep = strchr(buf, ' ');
+  if (sep == NULL) {
+    Serial.printf("Paket ohne Knotenname: %s\n", buf);
+    radio.startReceive(LORA_RX_TIMEOUT);
+    return;
+  }
+  *sep = '\0';
+  const char *src = buf;
+  const char *body = sep + 1;
+
+  Serial.printf("OK   %-10s %s\n", src, body);
+  sendToPi(src, body);
+
+  // Direkt wieder in den Empfang
+  radio.startReceive(LORA_RX_TIMEOUT);
 }
 
 // --------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("=== ESP-ThreadReceiver: Thread + CoAP -> Pi (UART0) ===");
+  Serial.println("=== ESP-ThreadReceiver-LoRa: Zentrale ===");
 
   // RGB-LED am SuperMini abschalten (GPIO8)
   pinMode(LED_PIN, OUTPUT);
@@ -196,67 +171,17 @@ void setup() {
   // UART zum Raspberry Pi (JSON-Zeilen, 115200 baud)
   PI_SERIAL.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
   delay(100);
-  PI_SERIAL.println("{\"sys\":\"ESP-ThreadReceiver boot\"}");
+  sendSysToPi("ESP-ThreadReceiver-LoRa boot");
 
-  // Thread-Netz beitreten / formen
-  if (!joinNetwork()) {
-    Serial.println("Thread-Beitritt fehlgeschlagen. Bitte Dataset-Werte prüfen.");
+  if (!initLora()) {
+    sendSysToPi("LoRa init failed");
   }
-
-  coap.setTimeout(COAP_TIMEOUT_MS);
-
-  // Kommittiertes Dataset zur Kontrolle ausgeben
-  Serial.printf("Dataset: Name=%s PAN=0x%04X Ch=%u ActiveDs=%s\n",
-                OThread.getNetworkName().c_str(), (int)OThread.getPanId(), (int)OThread.getChannel(),
-                OThread.hasActiveDataset() ? "ja" : "nein");
-  const uint8_t *xp = OThread.getExtendedPanId();
-  Serial.printf("ExtPAN: %02X%02X%02X%02X%02X%02X%02X%02X\n",
-                xp[0],xp[1],xp[2],xp[3],xp[4],xp[5],xp[6],xp[7]);
-  Serial.printf("EUI64 : %s\n", OThread.getEui64().c_str());
-
-  Serial.printf("Bereit. Pollinger %u Node(s) alle %d ms über UART0 (%d baud) an den Pi.\n",
-                NODE_COUNT, (int)POLL_INTERVAL_MS, (int)PI_BAUD);
 }
 
 // --------------------------------------------------------------------------
 void loop() {
-  static uint32_t lastRound = 0;
-  static uint32_t lastStatus = 0;
-  static const char *lastRole = "";
-
-  // Nur poller, wenn Thread aktiv ist
-  if (OThread.otGetDeviceRole() >= OT_ROLE_CHILD) {
-    uint32_t now = millis();
-    if (now - lastRound >= POLL_INTERVAL_MS) {
-      lastRound = now;
-
-      char body[256];
-      for (size_t i = 0; i < NODE_COUNT; i++) {
-        int rc = fetchNode(&nodes[i], body, sizeof(body));
-        if (rc == 0) {
-          nodeState[i].lastOkMs = now;
-          nodeState[i].failures = 0;
-          sendToPi(nodes[i].name, body);
-          Serial.printf("OK   %-10s %s\n", nodes[i].name, body);
-        } else {
-          nodeState[i].failures++;
-          const char *why = (rc < 0) ? "timeout" : "keine Antwort";
-          sendErrorToPi(nodes[i].name, why);
-          Serial.printf("FAIL %-10s code=%d (%s)\n", nodes[i].name, rc, why);
-        }
-      }
-    }
-  } else {
-    // Thread-Zustand im Hintergrund melden, solange noch keine Rolle besteht
-    const char *role = OThread.otGetStringDeviceRole();
-    uint32_t now = millis();
-    if (strcmp(role, lastRole) != 0 || now - lastStatus > 10000) {
-      lastStatus = now;
-      lastRole = role;
-      Serial.printf("Rolle: %s\n", role);
-    }
-    delay(500);
+  if (rxFlag) {
+    processPacket();
   }
-
-  delay(50);
+  delay(10);
 }
