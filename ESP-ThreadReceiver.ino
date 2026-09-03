@@ -4,7 +4,7 @@
  * ESP32-C6 (SuperMini): tritt demselben Thread-Netzwerk bei wie die
  * ESP-BME-Wetterknoten und fragt deren CoAP-Ressource /weather/all
  * ab. Die Messwerte werden als JSON-Zeilen an den Raspberry Pi
- * übergeben (verdrahtet, UART0: GPIO24 TX / GPIO23 RX, 115200 baud).
+ * übergeben (verdrahtet, UART0: GPIO16 TX / GPIO17 RX, 115200 baud).
  *
  * Übertragung:    Thread (802.15.4) + CoAP (UDP, 5683)
  * Rolle:          CoAP-Client / Thread-Router (FTD), kein OTBR nötig
@@ -13,25 +13,50 @@
  * Erweiterung:    Weitere Thread-Sender werden einfach als neuer Eintrag
  *                 im Array `nodes[]` ergänzt (Name + IPv6-Adresse).
  *
- * Benötigt:       Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module",
- *                 CDCOnBoot = Enabled (Serial = USB-CDC am COM-Port).
+ * Benötigt:       Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module"
+ *                 bzw. "MakerGO ESP32 C6 SuperMini". Die Debug-Konsole
+ *                 hängt fest am USB-Serial/JTAG (siehe CONSOLE unten) und
+ *                 funktioniert unabhängig von der Menü-Einstellung
+ *                 "USB CDC On Boot".
  *******************************************/
 #include <Arduino.h>
 #include <OThread.h>
 #include <OThreadCoAP.h>
 
 // --------------------------------------------------------------------------
+// Debug-Konsole am USB-Port (der COM-Port, den der PC sieht)
+//
+// Der C6 SuperMini hat KEINEN USB-UART-Bridge-Chip - der COM-Port ist das
+// eingebaute USB-Serial/JTAG-Peripheral (VID 303A / PID 1001). Der Arduino-
+// Core bildet `Serial` aber nur dann darauf ab, wenn im Boardmenue
+// "USB CDC On Boot: Enabled" gewaehlt ist. Default fuer alle C6-Boards ist
+// *Disabled*, und dann gilt `#define Serial Serial0` -> UART0 auf GPIO16/17,
+// also genau die Pins, die hier zum Pi gehen. Am COM-Port kommt dann nichts
+// an ("keine Ausgabe in der seriellen Konsole").
+//
+// Deshalb wird die Konsole hier explizit an das USB-Serial/JTAG gebunden,
+// unabhaengig von der Menue-Einstellung.
+// --------------------------------------------------------------------------
+#if ARDUINO_USB_CDC_ON_BOOT
+#define CONSOLE Serial            // Serial ist bereits das USB-Serial/JTAG (HWCDC)
+#else
+static HWCDC USBConsole;          // USB-Serial/JTAG selbst instanziieren
+#define CONSOLE USBConsole
+#endif
+
+// --------------------------------------------------------------------------
 // Schnittstelle zum Raspberry Pi (UART0, 3-Leiter: TX, RX, GND)
 // --------------------------------------------------------------------------
-// ESP32-C6: UART-TX/RX auf den Board-Standardpins GPIO24 (TX) / GPIO23 (RX).
+// SuperMini-Pinout (MakerGO): Pad "TX" = GPIO16 (TXD0), Pad "RX" = GPIO17
+// (RXD0). Das sind zugleich die UART0-Standardpins des C6.
 // Verdrahtung:
-//   C6 GPIO24 (TX)  -> Pi GPIO15 (RX, pin 10)
-//   C6 GPIO23 (RX)  -> Pi GPIO14 (TX, pin 8)
-//   C6 GND          -> Pi GND
+//   C6 Pad "TX" / GPIO16  -> Pi GPIO15 (RXD, pin 10)
+//   C6 Pad "RX" / GPIO17  <- Pi GPIO14 (TXD, pin 8)
+//   C6 GND                -> Pi GND (z. B. pin 6)
 #define PI_SERIAL    Serial0
 #define PI_BAUD      115200
-#define PI_TX_PIN    24     // GPIO24 -> Pi RX
-#define PI_RX_PIN    23     // GPIO23 <- Pi TX
+#define PI_TX_PIN    16     // Pad "TX", GPIO16 -> Pi RXD
+#define PI_RX_PIN    17     // Pad "RX", GPIO17 <- Pi TXD
 
 // --------------------------------------------------------------------------
 // Thread-Netzkonfiguration (Operational Dataset)
@@ -66,7 +91,10 @@ struct NodeConfig {
 };
 
 static NodeConfig nodes[] = {
-  {"wetter1", "fdae:7cba:5e6e:8852:e8e8:8f19:8183:86d9"},  // ESP-BME (H2)
+  // Mesh-Local EID des H2 - stabil ueber Reboots und Rollenwechsel. Sie wird
+  // vom ESP-BME-Sketch beim Start als "Mesh-Local EID: ..." ausgegeben.
+  {"wetter1", "fdd5:f199:8258:b9ad:6e93:1619:4fe4:41d6"},  // ESP-BME (H2)
+
   // {"wetter2", "fdde:ad00:beef:0000:0000:0000:0000:0002"},  // weiterer Knoten
 };
 #define NODE_COUNT (sizeof(nodes) / sizeof(nodes[0]))
@@ -139,27 +167,27 @@ static bool joinNetwork() {
     ds.setNetworkKey(THREAD_NETWORK_KEY);
     OThread.commitDataSet(ds);
   } else {
-    Serial.println("Wiederverwende gespeichertes Dataset aus NVS.");
+    CONSOLE.println("Wiederverwende gespeichertes Dataset aus NVS.");
   }
 
   OThread.networkInterfaceUp();
   OThread.start();
 
-  Serial.print("Warte auf Thread-Verbindung");
+  CONSOLE.print("Warte auf Thread-Verbindung");
   uint32_t start = millis();
   while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
     if (millis() - start > 60000) {
-      Serial.println("\nTimeout - keine Thread-Verbindung.");
+      CONSOLE.println("\nTimeout - keine Thread-Verbindung.");
       return false;
     }
-    Serial.print('.');
+    CONSOLE.print('.');
     delay(200);
   }
-  Serial.println();
+  CONSOLE.println();
 
-  Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
-  OThread.otPrintNetworkInformation(Serial);
-  Serial.printf("Mesh-Local EID (Leader): %s\n", OThread.getMeshLocalEid().toString().c_str());
+  CONSOLE.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
+  OThread.otPrintNetworkInformation(CONSOLE);
+  CONSOLE.printf("Mesh-Local EID (Leader): %s\n", OThread.getMeshLocalEid().toString().c_str());
   return true;
 }
 
@@ -185,9 +213,13 @@ static int fetchNode(const NodeConfig *node, char *out, size_t outLen) {
 
 // --------------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("=== ESP-ThreadReceiver: Thread + CoAP -> Pi (UART0) ===");
+  CONSOLE.begin(115200);
+  // Auf den Host warten, aber nicht ewig: ohne offenen Monitor laeuft es weiter.
+  while (!CONSOLE && millis() < 5000) {
+    delay(10);
+  }
+  delay(100);  // sonst geht die erste Zeile beim USB-Enumerieren verloren
+  CONSOLE.println("=== ESP-ThreadReceiver: Thread + CoAP -> Pi (UART0) ===");
 
   // RGB-LED am SuperMini abschalten (GPIO8)
   pinMode(LED_PIN, OUTPUT);
@@ -200,21 +232,21 @@ void setup() {
 
   // Thread-Netz beitreten / formen
   if (!joinNetwork()) {
-    Serial.println("Thread-Beitritt fehlgeschlagen. Bitte Dataset-Werte prüfen.");
+    CONSOLE.println("Thread-Beitritt fehlgeschlagen. Bitte Dataset-Werte prüfen.");
   }
 
   coap.setTimeout(COAP_TIMEOUT_MS);
 
   // Kommittiertes Dataset zur Kontrolle ausgeben
-  Serial.printf("Dataset: Name=%s PAN=0x%04X Ch=%u ActiveDs=%s\n",
+  CONSOLE.printf("Dataset: Name=%s PAN=0x%04X Ch=%u ActiveDs=%s\n",
                 OThread.getNetworkName().c_str(), (int)OThread.getPanId(), (int)OThread.getChannel(),
                 OThread.hasActiveDataset() ? "ja" : "nein");
   const uint8_t *xp = OThread.getExtendedPanId();
-  Serial.printf("ExtPAN: %02X%02X%02X%02X%02X%02X%02X%02X\n",
+  CONSOLE.printf("ExtPAN: %02X%02X%02X%02X%02X%02X%02X%02X\n",
                 xp[0],xp[1],xp[2],xp[3],xp[4],xp[5],xp[6],xp[7]);
-  Serial.printf("EUI64 : %s\n", OThread.getEui64().c_str());
+  CONSOLE.printf("EUI64 : %s\n", OThread.getEui64().c_str());
 
-  Serial.printf("Bereit. Pollinger %u Node(s) alle %d ms über UART0 (%d baud) an den Pi.\n",
+  CONSOLE.printf("Bereit. Polle %u Node(s) alle %d ms ueber UART0 (%d baud) an den Pi.\n",
                 NODE_COUNT, (int)POLL_INTERVAL_MS, (int)PI_BAUD);
 }
 
@@ -237,12 +269,12 @@ void loop() {
           nodeState[i].lastOkMs = now;
           nodeState[i].failures = 0;
           sendToPi(nodes[i].name, body);
-          Serial.printf("OK   %-10s %s\n", nodes[i].name, body);
+          CONSOLE.printf("OK   %-10s %s\n", nodes[i].name, body);
         } else {
           nodeState[i].failures++;
           const char *why = (rc < 0) ? "timeout" : "keine Antwort";
           sendErrorToPi(nodes[i].name, why);
-          Serial.printf("FAIL %-10s code=%d (%s)\n", nodes[i].name, rc, why);
+          CONSOLE.printf("FAIL %-10s code=%d (%s)\n", nodes[i].name, rc, why);
         }
       }
     }
@@ -253,7 +285,7 @@ void loop() {
     if (strcmp(role, lastRole) != 0 || now - lastStatus > 10000) {
       lastStatus = now;
       lastRole = role;
-      Serial.printf("Rolle: %s\n", role);
+      CONSOLE.printf("Rolle: %s\n", role);
     }
     delay(500);
   }
