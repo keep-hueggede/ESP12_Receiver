@@ -1,23 +1,28 @@
 /*******************************************
- * ESP-ThreadReceiver - Thread + CoAP Empfänger
+ * ESP-ThreadReceiver - Thread-Collector fuer Sensorknoten
  *
- * ESP32-C6 (SuperMini): tritt demselben Thread-Netzwerk bei wie die
- * ESP-BME-Wetterknoten und fragt deren CoAP-Ressource /weather/all
- * ab. Die Messwerte werden als JSON-Zeilen an den Raspberry Pi
- * übergeben (verdrahtet, UART0: GPIO16 TX / GPIO17 RX, 115200 baud).
+ * ESP32-C6 (SuperMini): formt das Thread-Netz (Leader/FTD), nimmt die
+ * Messwerte der Sensorknoten per CoAP entgegen und gibt sie als JSON-Zeilen
+ * an den Raspberry Pi weiter (verdrahtet, UART0: GPIO16 TX / GPIO17 RX,
+ * 115200 baud).
  *
- * Übertragung:    Thread (802.15.4) + CoAP (UDP, 5683)
- * Rolle:          CoAP-Client / Thread-Router (FTD), kein OTBR nötig
- * Ausgabe:        JSON-Zeile je Node und Abfrage (siehe sendToPi)
+ * Datenfluss:     Die Sensoren SENDEN (CoAP POST auf /ingest). Dieses Geraet
+ *                 fragt nichts ab. Grund: die Sensoren laufen als Sleepy End
+ *                 Devices mit abgeschaltetem Funkmodul und sind zwischen
+ *                 ihren Sendezeitpunkten nicht erreichbar. Eine Abfrage
+ *                 (Pull) wuerde in den Timeout laufen und den Stromspar-
+ *                 effekt zunichte machen.
  *
- * Erweiterung:    Weitere Thread-Sender werden einfach als neuer Eintrag
- *                 im Array `nodes[]` ergänzt (Name + IPv6-Adresse).
+ * Erweiterung:    Ein neuer Sensor braucht KEINE Aenderung an diesem Sketch.
+ *                 Er kommissioniert sich mit dem PSKd (siehe JOINER_PSKD) und
+ *                 traegt seinen Namen selbst im Feld "src" der Nutzlast.
  *
- * Benötigt:       Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module"
- *                 bzw. "MakerGO ESP32 C6 SuperMini". Die Debug-Konsole
- *                 hängt fest am USB-Serial/JTAG (siehe CONSOLE unten) und
- *                 funktioniert unabhängig von der Menü-Einstellung
- *                 "USB CDC On Boot".
+ * Rolle:          Thread-Leader, CoAP-Server, Commissioner
+ *
+ * Benoetigt:      Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module" bzw.
+ *                 "MakerGO ESP32 C6 SuperMini". Die Debug-Konsole haengt fest
+ *                 am USB-Serial/JTAG (siehe CONSOLE unten) und funktioniert
+ *                 unabhaengig von der Menue-Einstellung "USB CDC On Boot".
  *******************************************/
 #include <Arduino.h>
 #include <OThread.h>
@@ -61,14 +66,14 @@ static HWCDC USBConsole;          // USB-Serial/JTAG selbst instanziieren
 // --------------------------------------------------------------------------
 // Thread-Netzkonfiguration (Operational Dataset)
 //
-// Dieses Gerät FORMST das Thread-Netz (Leader-Rolle, wie der offizielle
-// "LeaderNode" Example) und vergibt dabei frische Timestamps + Mesh-Local-
-// Prefix via initNew(). Der ESP-BME-Knoten tritt mit NUR dem Network Key
-// bei (Client-Pattern, siehe sensor_client Example).
+// Dieses Geraet FORMT das Thread-Netz (Leader-Rolle). WICHTIG: initNew()
+// erzeugt ein frisches Dataset (Timestamps + Mesh-Local-Prefix). Das wird in
+// NVS persistiert und darf daher nur EINMAL beim ersten Start passieren,
+// sonst aendert sich das Mesh-Local-Prefix bei jedem Reboot.
 //
-// Beim ersten Start wird das Netz mit diesen festen Werten angelegt. Damit
-// der Knoten sich zuordnet, müssen Network Key (und idealerweise Name/PAN/
-// Kanal) in beiden Sketches identisch sein.
+// Die Sensorknoten bekommen dieses Dataset NICHT hartcodiert, sondern per
+// Commissioning ueber die Luft (siehe JOINER_PSKD). Damit existiert im
+// gesamten Netz genau ein Dataset und genau ein Mesh-Local-Prefix.
 // --------------------------------------------------------------------------
 static const char     THREAD_NETWORK_NAME[] = "Wetter-Thread";
 static const uint16_t THREAD_PAN_ID         = 0x2345;
@@ -78,85 +83,84 @@ static const uint8_t  THREAD_NETWORK_KEY[16] = {0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x
                                                 0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90};
 
 // --------------------------------------------------------------------------
-// Nodes (Thread-Sender), die abgefragt werden sollen.
+// Commissioning
 //
-// Jede Zeile = ein Gerät. Die IPv6-Adresse ist die Thread-EID (Mesh-Local
-// EID) des jeweiligen Knotens - ausgegeben von dessen otPrintNetworkInformation
-// ("MLEID" bzw. die fdXX:...-Adresse unter IPv6) bzw. `ot ipaddr`.
-// Neues Gerät anlegen = neue Zeile im Array, fertig.
+// Der PSKd ist das gemeinsame Geheimnis, mit dem sich ein neuer Sensor
+// anmeldet. Erlaubt sind 6..32 Zeichen aus dem Base32-Thread-Alphabet
+// (0-9, A-Y ohne I, O, Q, Z).
+//
+// Das Fenster wird beim Start geoeffnet und laeuft ab. Ein Druck auf 'c' in
+// der Konsole oeffnet es erneut - so ist das Netz im Normalbetrieb zu.
 // --------------------------------------------------------------------------
-struct NodeConfig {
-  const char *name;  // Anzeigename, wird als "src" an den Pi gesendet
-  const char *eid;   // IPv6-Adresse des Knotens (Thread-EID)
-};
-
-static NodeConfig nodes[] = {
-  // Mesh-Local EID des H2 - stabil ueber Reboots und Rollenwechsel. Sie wird
-  // vom ESP-BME-Sketch beim Start als "Mesh-Local EID: ..." ausgegeben.
-  {"wetter1", "fdd5:f199:8258:b9ad:6e93:1619:4fe4:41d6"},  // ESP-BME (H2)
-
-  // {"wetter2", "fdde:ad00:beef:0000:0000:0000:0000:0002"},  // weiterer Knoten
-};
-#define NODE_COUNT (sizeof(nodes) / sizeof(nodes[0]))
+static const char JOINER_PSKD[] = "WETTER01";
+#define COMMISSION_WINDOW_S  600   // Dauer des Anmeldefensters in Sekunden
 
 // --------------------------------------------------------------------------
-// Abfrage-Timing
+// CoAP-Ressource, auf der die Sensoren ihre Messwerte abliefern
 // --------------------------------------------------------------------------
-#define POLL_INTERVAL_MS  5000   // Abstand zwischen zwei Abfrage-Runden
-#define COAP_TIMEOUT_MS   3000   // Timeout je Node-Abfrage
-#define MAX_FAILURES      3      // Fehlversuche, bis ein Node als offline markiert wird
+static const char *INGEST_PATH = "ingest";
 
-static const char *WEATHER_PATH = "weather/all";
+#define MAX_PAYLOAD  256   // groesste akzeptierte Nutzlast (JSON-Objekt)
 
 // --------------------------------------------------------------------------
 // RGB-LED am SuperMini (GPIO8) beim Start abschalten
 // --------------------------------------------------------------------------
 #define LED_PIN 8
 
-// --------------------------------------------------------------------------
-// OpenThread / CoAP
-// --------------------------------------------------------------------------
-OThreadCoAPClient coap;
-
-// Letzter bekannter Status je Node (für Offline-Erkennung)
-static struct {
-  uint32_t lastOkMs;   // millis() des letzten erfolgreichen Abrufs
-  uint32_t failures;   // aufeinanderfolgende Fehlversuche
-} nodeState[NODE_COUNT];
+// Statistik
+static uint32_t g_received = 0;   // angenommene Messungen
+static uint32_t g_rejected = 0;   // verworfene Nutzlasten
 
 // --------------------------------------------------------------------------
-// JSON-Zeile an den Raspberry Pi senden. Erwartet wird ein fertiges
-// JSON-Objekt OHNE äußere Klammern, z. B.:
-//   "temp":21.5,"pressure":1013.2,...
+// JSON-Zeile an den Raspberry Pi weitergeben.
+//
+// Die Sensoren liefern bereits ein vollstaendiges JSON-Objekt inklusive dem
+// Feld "src". Es wird unveraendert als eine Zeile durchgereicht - der Parser
+// auf dem Pi sieht dasselbe Format wie bisher.
 // --------------------------------------------------------------------------
-static void sendToPi(const char *src, const char *body) {
-  PI_SERIAL.print("{\"src\":\"");
-  PI_SERIAL.print(src);
-  PI_SERIAL.print("\",");
-  PI_SERIAL.print(body);
-  PI_SERIAL.println("}");
+static void sendToPi(const char *json) {
+  PI_SERIAL.println(json);
 }
 
-static void sendErrorToPi(const char *src, const char *err) {
-  PI_SERIAL.print("{\"src\":\"");
-  PI_SERIAL.print(src);
-  PI_SERIAL.print("\",\"error\":\"");
-  PI_SERIAL.print(err);
+static void sendEventToPi(const char *event) {
+  PI_SERIAL.print("{\"sys\":\"");
+  PI_SERIAL.print(event);
   PI_SERIAL.println("\"}");
 }
 
 // --------------------------------------------------------------------------
-// Thread-Netz beitreten / formen (Dataset-basiert)
+// CoAP-Handler: ein Sensor liefert Messwerte ab (POST /ingest)
+//
+// Die Nutzlast muss ein einzelnes JSON-Objekt sein. Mehr wird hier bewusst
+// nicht geprueft: der Knoten ist bereits per Thread-Netzwerkschluessel
+// authentifiziert, und die Auswertung passiert auf dem Pi.
+// --------------------------------------------------------------------------
+static void handleIngest(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
+  String payload = req.payloadString();
+
+  bool ok = payload.length() >= 2 && payload.length() <= MAX_PAYLOAD && payload[0] == '{' && payload[payload.length() - 1] == '}';
+
+  if (ok) {
+    g_received++;
+    sendToPi(payload.c_str());
+    CONSOLE.printf("RX   %-40s %s\n", req.remoteIP().toString().c_str(), payload.c_str());
+  } else {
+    g_rejected++;
+    CONSOLE.printf("DROP %-40s (%u Bytes, kein JSON-Objekt)\n", req.remoteIP().toString().c_str(), (unsigned)payload.length());
+  }
+
+  // Immer quittieren: der Sensor wertet das ACK aus, um zu erkennen, ob seine
+  // Messung angekommen ist. Ohne send() wuerde der Server zwar automatisch
+  // antworten, aber wir wollen das hier explizit im Code sehen.
+  resp.send();
+}
+
+// --------------------------------------------------------------------------
+// Thread-Netz formen (Dataset-basiert, persistiert in NVS)
 // --------------------------------------------------------------------------
 static bool joinNetwork() {
   OThread.begin(false);
 
-  // Dieses Gerät FORMST das Thread-Netz (Leader-Rolle). WICHTIG: initNew()
-  // erzeugt ein frisches Dataset (Timestamps + Mesh-Local-Prefix). Das wird
-  // in NVS persistiert und darf daher nur EINMAL beim ersten Start passieren,
-  // sonst ändert sich das Mesh-Local-Prefix bei jedem Reboot und damit auch
-  // die EID aller Knoten. Nach einem Reboot wird das gespeicherte Dataset
-  // übernommen und das Netz identisch wiederhergestellt.
   if (!OThread.hasActiveDataset()) {
     DataSet ds;
     ds.initNew();
@@ -166,6 +170,7 @@ static bool joinNetwork() {
     ds.setExtendedPanId(THREAD_EXT_PAN_ID);
     ds.setNetworkKey(THREAD_NETWORK_KEY);
     OThread.commitDataSet(ds);
+    CONSOLE.println("Neues Dataset angelegt (initNew + Netzparameter).");
   } else {
     CONSOLE.println("Wiederverwende gespeichertes Dataset aus NVS.");
   }
@@ -187,28 +192,44 @@ static bool joinNetwork() {
 
   CONSOLE.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
   OThread.otPrintNetworkInformation(CONSOLE);
-  CONSOLE.printf("Mesh-Local EID (Leader): %s\n", OThread.getMeshLocalEid().toString().c_str());
+  CONSOLE.printf("Mesh-Local EID: %s\n", OThread.getMeshLocalEid().toString().c_str());
   return true;
 }
 
 // --------------------------------------------------------------------------
-// Einen Node per CoAP abfragen und Antwort als JSON-Body liefern.
-// Rückgabe: 0 = Erfolg, <0 = CoAP-Fehler (siehe OT_COAP_ERROR_*)
+// Anmeldefenster fuer neue Sensoren oeffnen.
+//
+// startCommissioner() petitioniert das Netz um die Commissioner-Rolle; das
+// geht nur, wenn dieses Geraet attached ist. addJoiner() traegt anschliessend
+// den PSKd ein, mit dem sich JEDER Sensor anmelden darf (eui64 = nullptr).
 // --------------------------------------------------------------------------
-static int fetchNode(const NodeConfig *node, char *out, size_t outLen) {
-  int code = coap.GET(node->eid, WEATHER_PATH);
-  if (code <= 0) {
-    return code;  // negativer OT_COAP_ERROR_*
+static bool openCommissioning() {
+#if CONFIG_OPENTHREAD_COMMISSIONER
+  if (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
+    CONSOLE.println("Commissioning nicht moeglich: Geraet ist nicht attached.");
+    return false;
   }
-  String payload = coap.getString();
-  if (payload.length() == 0) {
-    return -2;  // leere Antwort
+
+  otError err = OThread.startCommissioner();
+  if (err != OT_ERROR_NONE) {
+    CONSOLE.printf("startCommissioner fehlgeschlagen: %d\n", (int)err);
+    return false;
   }
-  size_t n = payload.length();
-  if (n > outLen - 1) n = outLen - 1;
-  memcpy(out, payload.c_str(), n);
-  out[n] = '\0';
-  return 0;
+
+  err = OThread.addJoiner(JOINER_PSKD, COMMISSION_WINDOW_S, nullptr);
+  if (err != OT_ERROR_NONE) {
+    CONSOLE.printf("addJoiner fehlgeschlagen: %d\n", (int)err);
+    OThread.stopCommissioner();
+    return false;
+  }
+
+  CONSOLE.printf("Anmeldefenster offen fuer %d s (PSKd '%s'). Neue Sensoren koennen jetzt beitreten.\n", COMMISSION_WINDOW_S, JOINER_PSKD);
+  sendEventToPi("commissioning window open");
+  return true;
+#else
+  CONSOLE.println("Commissioner ist in diesem Core-Build nicht aktiviert.");
+  return false;
+#endif
 }
 
 // --------------------------------------------------------------------------
@@ -219,7 +240,7 @@ void setup() {
     delay(10);
   }
   delay(100);  // sonst geht die erste Zeile beim USB-Enumerieren verloren
-  CONSOLE.println("=== ESP-ThreadReceiver: Thread + CoAP -> Pi (UART0) ===");
+  CONSOLE.println("=== ESP-ThreadReceiver: Thread-Collector -> Pi (UART0) ===");
 
   // RGB-LED am SuperMini abschalten (GPIO8)
   pinMode(LED_PIN, OUTPUT);
@@ -228,67 +249,54 @@ void setup() {
   // UART zum Raspberry Pi (JSON-Zeilen, 115200 baud)
   PI_SERIAL.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
   delay(100);
-  PI_SERIAL.println("{\"sys\":\"ESP-ThreadReceiver boot\"}");
+  sendEventToPi("ESP-ThreadReceiver boot");
 
-  // Thread-Netz beitreten / formen
   if (!joinNetwork()) {
-    CONSOLE.println("Thread-Beitritt fehlgeschlagen. Bitte Dataset-Werte prüfen.");
+    CONSOLE.println("Thread-Start fehlgeschlagen. Bitte Dataset-Werte pruefen.");
   }
 
-  coap.setTimeout(COAP_TIMEOUT_MS);
+  // CoAP-Server: hier liefern die Sensoren ab.
+  OThreadCoAPServer.on(INGEST_PATH, OT_COAP_METHOD_POST, handleIngest, nullptr);
+  OThreadCoAPServer.begin();
+  CONSOLE.printf("CoAP-Server bereit: POST /%s\n", INGEST_PATH);
 
-  // Kommittiertes Dataset zur Kontrolle ausgeben
-  CONSOLE.printf("Dataset: Name=%s PAN=0x%04X Ch=%u ActiveDs=%s\n",
-                OThread.getNetworkName().c_str(), (int)OThread.getPanId(), (int)OThread.getChannel(),
-                OThread.hasActiveDataset() ? "ja" : "nein");
-  const uint8_t *xp = OThread.getExtendedPanId();
-  CONSOLE.printf("ExtPAN: %02X%02X%02X%02X%02X%02X%02X%02X\n",
-                xp[0],xp[1],xp[2],xp[3],xp[4],xp[5],xp[6],xp[7]);
-  CONSOLE.printf("EUI64 : %s\n", OThread.getEui64().c_str());
+  // Beim Start ein Anmeldefenster oeffnen, damit neue Sensoren ohne
+  // Zusatzhandgriff dazukommen koennen.
+  openCommissioning();
 
-  CONSOLE.printf("Bereit. Polle %u Node(s) alle %d ms ueber UART0 (%d baud) an den Pi.\n",
-                NODE_COUNT, (int)POLL_INTERVAL_MS, (int)PI_BAUD);
+  CONSOLE.println("Bereit. Taste 'c' oeffnet ein neues Anmeldefenster, 's' zeigt den Status.");
 }
 
 // --------------------------------------------------------------------------
 void loop() {
-  static uint32_t lastRound = 0;
-  static uint32_t lastStatus = 0;
   static const char *lastRole = "";
+  static uint32_t lastStatus = 0;
 
-  // Nur poller, wenn Thread aktiv ist
-  if (OThread.otGetDeviceRole() >= OT_ROLE_CHILD) {
-    uint32_t now = millis();
-    if (now - lastRound >= POLL_INTERVAL_MS) {
-      lastRound = now;
-
-      char body[256];
-      for (size_t i = 0; i < NODE_COUNT; i++) {
-        int rc = fetchNode(&nodes[i], body, sizeof(body));
-        if (rc == 0) {
-          nodeState[i].lastOkMs = now;
-          nodeState[i].failures = 0;
-          sendToPi(nodes[i].name, body);
-          CONSOLE.printf("OK   %-10s %s\n", nodes[i].name, body);
-        } else {
-          nodeState[i].failures++;
-          const char *why = (rc < 0) ? "timeout" : "keine Antwort";
-          sendErrorToPi(nodes[i].name, why);
-          CONSOLE.printf("FAIL %-10s code=%d (%s)\n", nodes[i].name, rc, why);
-        }
-      }
-    }
-  } else {
-    // Thread-Zustand im Hintergrund melden, solange noch keine Rolle besteht
-    const char *role = OThread.otGetStringDeviceRole();
-    uint32_t now = millis();
-    if (strcmp(role, lastRole) != 0 || now - lastStatus > 10000) {
-      lastStatus = now;
-      lastRole = role;
-      CONSOLE.printf("Rolle: %s\n", role);
-    }
-    delay(500);
+  // Rollenwechsel melden (z. B. Leader -> Router nach einem Merge)
+  const char *role = OThread.otGetStringDeviceRole();
+  if (strcmp(role, lastRole) != 0) {
+    lastRole = role;
+    CONSOLE.printf("Rolle: %s\n", role);
   }
 
-  delay(50);
+  // Konsolen-Kommandos
+  while (CONSOLE.available()) {
+    int c = CONSOLE.read();
+    if (c == 'c' || c == 'C') {
+      openCommissioning();
+    } else if (c == 's' || c == 'S') {
+      CONSOLE.printf("Status: Rolle=%s RLOC16=0x%04X empfangen=%lu verworfen=%lu Laufzeit=%lus\n",
+                     role, OThread.getRloc16(), (unsigned long)g_received, (unsigned long)g_rejected, (unsigned long)(millis() / 1000));
+    }
+  }
+
+  // Lebenszeichen alle 60 s, damit im Log sichtbar bleibt, dass der Collector
+  // laeuft - auch wenn gerade kein Sensor sendet.
+  uint32_t now = millis();
+  if (now - lastStatus >= 60000) {
+    lastStatus = now;
+    CONSOLE.printf("... %s, %lu Messung(en) empfangen\n", role, (unsigned long)g_received);
+  }
+
+  delay(20);
 }
