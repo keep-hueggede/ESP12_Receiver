@@ -290,6 +290,21 @@ void loop() {
     }
   }
 
+  // Alles, was vom Pi kommt, auf der Konsole zeigen (Verdrahtungs-Check:
+  // auf dem Pi z. B. `echo ping > /dev/serial0`).
+  static char piLine[128];
+  static size_t piLen = 0;
+  while (PI_SERIAL.available()) {
+    int c = PI_SERIAL.read();
+    if (c == '\n' || piLen == sizeof(piLine) - 1) {
+      piLine[piLen] = '\0';
+      CONSOLE.printf("PI   %s\n", piLine);
+      piLen = 0;
+    } else if (c != '\r') {
+      piLine[piLen++] = (char)c;
+    }
+  }
+
   // Lebenszeichen alle 60 s, damit im Log sichtbar bleibt, dass der Collector
   // laeuft - auch wenn gerade kein Sensor sendet.
   uint32_t now = millis();
