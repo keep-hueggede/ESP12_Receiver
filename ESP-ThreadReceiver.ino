@@ -103,9 +103,11 @@ static const char *INGEST_PATH = "ingest";
 #define MAX_PAYLOAD  256   // groesste akzeptierte Nutzlast (JSON-Objekt)
 
 // --------------------------------------------------------------------------
-// RGB-LED am SuperMini (GPIO8) beim Start abschalten
+// LEDs am SuperMini beim Start abschalten: RGB-LED (WS2812, GPIO8) und blaue
+// LED (GPIO15). Die rote Power-LED haengt fest an 3V3 (nur per Hardware).
 // --------------------------------------------------------------------------
-#define LED_PIN 8
+#define LED_PIN      8
+#define BLUE_LED_PIN 15
 
 // Statistik
 static uint32_t g_received = 0;   // angenommene Messungen
@@ -242,9 +244,10 @@ void setup() {
   delay(100);  // sonst geht die erste Zeile beim USB-Enumerieren verloren
   CONSOLE.println("=== ESP-ThreadReceiver: Thread-Collector -> Pi (UART0) ===");
 
-  // RGB-LED am SuperMini abschalten (GPIO8)
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // WS2812 keeps its last colour; only a black frame switches it off
+  rgbLedWrite(LED_PIN, 0, 0, 0);
+  // High impedance switches the blue LED off whether it is wired active-high or active-low
+  pinMode(BLUE_LED_PIN, INPUT);
 
   // UART zum Raspberry Pi (JSON-Zeilen, 115200 baud)
   PI_SERIAL.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
