@@ -19,6 +19,16 @@
  *
  * Rolle:          Thread-Leader, CoAP-Server, Commissioner
  *
+ * Firmware-Update der Sensoren:
+ *                 Der Pi laedt neue Sensor-Firmware von GitHub und schiebt
+ *                 sie per UART hierher (Zeilen "FW BEGIN/DATA/END", siehe
+ *                 handlePiCommand). Das Abbild liegt in der ungenutzten
+ *                 SPIFFS-Partition, Version/Groesse/SHA-256 im NVS. Meldet
+ *                 ein Sensor eine andere Version ("fw"), bekommt er in der
+ *                 Antwort auf /ingest ein Angebot und holt das Abbild in
+ *                 512-Byte-Bloecken ueber POST /fw ab. Pro Sensor und
+ *                 Version hoechstens FW_MAX_OFFERS Angebote.
+ *
  * Benoetigt:      Arduino-Core esp32 v3.x, Board "ESP32C6 Dev Module" bzw.
  *                 "MakerGO ESP32 C6 SuperMini". Die Debug-Konsole haengt fest
  *                 am USB-Serial/JTAG (siehe CONSOLE unten) und funktioniert
@@ -27,6 +37,11 @@
 #include <Arduino.h>
 #include <OThread.h>
 #include <OThreadCoAP.h>
+#include <Preferences.h>
+#include <map>
+#include "esp_partition.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/sha256.h"
 
 // --------------------------------------------------------------------------
 // Debug-Konsole am USB-Port (der COM-Port, den der PC sieht)
@@ -99,8 +114,32 @@ static const char JOINER_PSKD[] = "WETTER01";
 // CoAP-Ressource, auf der die Sensoren ihre Messwerte abliefern
 // --------------------------------------------------------------------------
 static const char *INGEST_PATH = "ingest";
+static const char *FW_PATH     = "fw";
 
 #define MAX_PAYLOAD  256   // groesste akzeptierte Nutzlast (JSON-Objekt)
+
+// --------------------------------------------------------------------------
+// Firmware-Puffer fuer die Sensoren
+// --------------------------------------------------------------------------
+#define FW_BLOCK        512   // bytes per CoAP response (OT_COAP_MAX_PAYLOAD)
+#define FW_MAX_OFFERS   3     // per sensor and version, so a bad image cannot drain batteries
+#define FW_SECTOR       4096
+
+struct FwImage {
+  String   version;           // "" = no complete image
+  uint32_t size = 0;
+  String   sha256;            // lowercase hex
+};
+
+static const esp_partition_t *g_fwPart = nullptr;
+static FwImage  g_fw;              // complete image offered to the sensors
+static FwImage  g_fwUpload;        // image currently coming from the Pi
+static uint32_t g_fwWritten = 0;
+static uint32_t g_fwErased = 0;
+static std::map<String, uint8_t> g_fwOffers;   // src -> offers of g_fw.version
+static SemaphoreHandle_t g_fwLock;             // g_fw is read in the OpenThread task
+static SemaphoreHandle_t g_piLock;             // one writer per UART line
+static Preferences g_prefs;
 
 // --------------------------------------------------------------------------
 // LEDs am SuperMini beim Start abschalten: RGB-LED (WS2812, GPIO8) und blaue
@@ -120,14 +159,237 @@ static uint32_t g_rejected = 0;   // verworfene Nutzlasten
 // Feld "src". Es wird unveraendert als eine Zeile durchgereicht - der Parser
 // auf dem Pi sieht dasselbe Format wie bisher.
 // --------------------------------------------------------------------------
+// Lines come from the OpenThread task and from loop(): write each one in one piece
 static void sendToPi(const char *json) {
-  PI_SERIAL.println(json);
+  xSemaphoreTake(g_piLock, portMAX_DELAY);
+  PI_SERIAL.write((const uint8_t *)json, strlen(json));
+  PI_SERIAL.write('\n');
+  xSemaphoreGive(g_piLock);
 }
 
 static void sendEventToPi(const char *event) {
-  PI_SERIAL.print("{\"sys\":\"");
-  PI_SERIAL.print(event);
-  PI_SERIAL.println("\"}");
+  char line[160];
+  snprintf(line, sizeof(line), "{\"sys\":\"%s\"}", event);
+  sendToPi(line);
+}
+
+// --------------------------------------------------------------------------
+// Firmware-Puffer: Abbild im Flash, Metadaten im NVS
+// --------------------------------------------------------------------------
+static void loadFirmwareMeta() {
+  g_fwPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+  g_prefs.begin("fwstore", false);
+  g_fw.version = g_prefs.getString("ver", "");
+  g_fw.size = g_prefs.getUInt("size", 0);
+  g_fw.sha256 = g_prefs.getString("sha", "");
+  if (!g_fwPart) {
+    g_fw = FwImage();
+    CONSOLE.println("Firmware-Puffer: keine SPIFFS-Partition - Sensor-Updates deaktiviert.");
+  } else if (g_fw.version.length()) {
+    CONSOLE.printf("Firmware-Puffer: Sensor-Firmware %s (%lu Bytes)\n", g_fw.version.c_str(), (unsigned long)g_fw.size);
+  }
+}
+
+static void setStoredFirmware(const FwImage &img) {
+  xSemaphoreTake(g_fwLock, portMAX_DELAY);
+  g_fw = img;
+  g_fwOffers.clear();
+  xSemaphoreGive(g_fwLock);
+  g_prefs.putString("ver", img.version);
+  g_prefs.putUInt("size", img.size);
+  g_prefs.putString("sha", img.sha256);
+}
+
+static bool partitionSha256(uint32_t size, char *hexOut) {
+  static uint8_t buf[FW_SECTOR];
+  uint8_t digest[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  for (uint32_t off = 0; off < size; off += sizeof(buf)) {
+    uint32_t n = min((uint32_t)sizeof(buf), size - off);
+    if (esp_partition_read(g_fwPart, off, buf, n) != ESP_OK) {
+      mbedtls_sha256_free(&ctx);
+      return false;
+    }
+    mbedtls_sha256_update(&ctx, buf, n);
+  }
+  mbedtls_sha256_finish(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(hexOut + 2 * i, "%02x", digest[i]);
+  return true;
+}
+
+static void fwReply(const char *fmt, ...) {
+  char line[200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  sendToPi(line);
+}
+
+// --------------------------------------------------------------------------
+// Befehle vom Pi (eine Zeile je Befehl, Antwort als JSON-Zeile {"fw":...}):
+//   FW STATUS                            -> status: gespeicherte Version
+//   FW BEGIN <version> <size> <sha256>   -> ready  (altes Abbild wird ungueltig)
+//   FW DATA <offset> <base64>            -> ack mit dem naechsten erwarteten Offset
+//   FW END                               -> stored (SHA-256 geprueft) oder error
+// --------------------------------------------------------------------------
+static void handlePiCommand(char *line) {
+  if (strncmp(line, "FW ", 3) != 0) {
+    CONSOLE.printf("PI   %s\n", line);
+    return;
+  }
+  char *cmd = line + 3;
+
+  if (strcmp(cmd, "STATUS") == 0) {
+    xSemaphoreTake(g_fwLock, portMAX_DELAY);
+    FwImage img = g_fw;
+    xSemaphoreGive(g_fwLock);
+    fwReply("{\"fw\":\"status\",\"version\":\"%s\",\"size\":%lu,\"sha256\":\"%s\",\"capacity\":%lu}",
+            img.version.c_str(), (unsigned long)img.size, img.sha256.c_str(),
+            (unsigned long)(g_fwPart ? g_fwPart->size : 0));
+
+  } else if (strncmp(cmd, "BEGIN ", 6) == 0) {
+    char ver[32], sha[65];
+    unsigned long size = 0;
+    if (sscanf(cmd + 6, "%31s %lu %64s", ver, &size, sha) != 3 || strlen(sha) != 64) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"bad BEGIN\"}");
+    } else if (!g_fwPart || size == 0 || size > g_fwPart->size) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"image does not fit\"}");
+    } else {
+      setStoredFirmware(FwImage());   // stop offering the old image before overwriting it
+      g_fwUpload.version = ver;
+      g_fwUpload.size = size;
+      g_fwUpload.sha256 = sha;
+      g_fwWritten = 0;
+      g_fwErased = 0;
+      CONSOLE.printf("Firmware-Upload %s (%lu Bytes) startet\n", ver, size);
+      fwReply("{\"fw\":\"ready\"}");
+    }
+
+  } else if (strncmp(cmd, "DATA ", 5) == 0) {
+    static uint8_t data[768];
+    char *space = strchr(cmd + 5, ' ');
+    if (!g_fwUpload.size || !space) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"no upload\"}");
+      return;
+    }
+    *space = '\0';
+    uint32_t off = strtoul(cmd + 5, nullptr, 10);
+    size_t len = 0;
+    if (mbedtls_base64_decode(data, sizeof(data), &len, (const uint8_t *)(space + 1), strlen(space + 1)) != 0) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"bad base64\"}");
+      return;
+    }
+    if (off + len <= g_fwWritten) {
+      // repeated chunk (the Pi missed our ack): already written
+    } else if (off != g_fwWritten || off + len > g_fwUpload.size) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"unexpected offset\",\"expected\":%lu}", (unsigned long)g_fwWritten);
+      return;
+    } else {
+      while (g_fwErased < off + len) {
+        if (esp_partition_erase_range(g_fwPart, g_fwErased, FW_SECTOR) != ESP_OK) {
+          fwReply("{\"fw\":\"error\",\"msg\":\"erase failed\"}");
+          return;
+        }
+        g_fwErased += FW_SECTOR;
+      }
+      if (esp_partition_write(g_fwPart, off, data, len) != ESP_OK) {
+        fwReply("{\"fw\":\"error\",\"msg\":\"write failed\"}");
+        return;
+      }
+      g_fwWritten = off + len;
+    }
+    fwReply("{\"fw\":\"ack\",\"off\":%lu}", (unsigned long)g_fwWritten);
+
+  } else if (strcmp(cmd, "END") == 0) {
+    char hex[65];
+    if (!g_fwUpload.size || g_fwWritten != g_fwUpload.size) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"incomplete\",\"written\":%lu}", (unsigned long)g_fwWritten);
+    } else if (!partitionSha256(g_fwUpload.size, hex) || g_fwUpload.sha256 != hex) {
+      fwReply("{\"fw\":\"error\",\"msg\":\"checksum mismatch\"}");
+    } else {
+      setStoredFirmware(g_fwUpload);
+      CONSOLE.printf("Sensor-Firmware %s gespeichert, wird den Sensoren angeboten\n", g_fwUpload.version.c_str());
+      fwReply("{\"fw\":\"stored\",\"version\":\"%s\"}", g_fwUpload.version.c_str());
+    }
+    g_fwUpload = FwImage();
+
+  } else {
+    fwReply("{\"fw\":\"error\",\"msg\":\"unknown command\"}");
+  }
+}
+
+// Value of a "key":"text" pair in a flat JSON object ("" if missing)
+static String jsonText(const String &json, const char *key) {
+  String pattern = String("\"") + key + "\":\"";
+  int start = json.indexOf(pattern);
+  if (start < 0) return "";
+  start += pattern.length();
+  int end = json.indexOf('"', start);
+  return end < 0 ? "" : json.substring(start, end);
+}
+
+// Offer the stored image to a sensor that reports another version ("dev" builds opt out)
+static bool firmwareOffer(const String &payload, char *out, size_t outLen) {
+  String fw = jsonText(payload, "fw");
+  String src = jsonText(payload, "src");
+  if (!fw.length() || fw == "dev" || !src.length()) return false;
+
+  bool offer = false;
+  uint8_t count = 0;
+  String version;
+  xSemaphoreTake(g_fwLock, portMAX_DELAY);
+  if (g_fw.version.length() && fw != g_fw.version) {
+    uint8_t &n = g_fwOffers[src];
+    if (n < FW_MAX_OFFERS) {
+      count = ++n;
+      offer = true;
+      version = g_fw.version;
+      snprintf(out, outLen, "{\"ota\":\"%s\",\"size\":%lu,\"sha256\":\"%s\"}",
+               g_fw.version.c_str(), (unsigned long)g_fw.size, g_fw.sha256.c_str());
+    }
+  }
+  xSemaphoreGive(g_fwLock);
+
+  if (offer) {
+    char event[120];
+    snprintf(event, sizeof(event), "fw offer %s %s -> %s (%u/%u)", src.c_str(), fw.c_str(), version.c_str(),
+             count, FW_MAX_OFFERS);
+    CONSOLE.printf("FW   Angebot an %s: %s -> %s (%u/%u)\n", src.c_str(), fw.c_str(), version.c_str(), count,
+                   FW_MAX_OFFERS);
+    sendEventToPi(event);
+  }
+  return offer;
+}
+
+// --------------------------------------------------------------------------
+// CoAP-Handler: ein Sensor holt einen Block des Abbilds (POST /fw, Nutzlast:
+// Offset als Dezimalzahl). Antwort: bis zu FW_BLOCK Bytes ab diesem Offset.
+// --------------------------------------------------------------------------
+static void handleFw(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
+  static uint8_t block[FW_BLOCK];
+  uint32_t off = (uint32_t)strtoul(req.payloadString().c_str(), nullptr, 10);
+
+  xSemaphoreTake(g_fwLock, portMAX_DELAY);
+  uint32_t size = g_fw.size;
+  size_t n = 0;
+  bool ok = size > 0 && off < size;
+  if (ok) {
+    n = min((uint32_t)FW_BLOCK, size - off);
+    ok = esp_partition_read(g_fwPart, off, block, n) == ESP_OK;
+  }
+  xSemaphoreGive(g_fwLock);
+
+  if (!ok) {
+    resp.setCode(OT_COAP_RESP_NOT_FOUND);
+  } else {
+    resp.setContentFormat(OT_COAP_FORMAT_OCTET_STREAM);
+    resp.setPayload(block, n);
+  }
+  resp.send();
 }
 
 // --------------------------------------------------------------------------
@@ -152,8 +414,12 @@ static void handleIngest(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, voi
   }
 
   // Immer quittieren: der Sensor wertet das ACK aus, um zu erkennen, ob seine
-  // Messung angekommen ist. Ohne send() wuerde der Server zwar automatisch
-  // antworten, aber wir wollen das hier explizit im Code sehen.
+  // Messung angekommen ist. Die Antwort traegt ggf. ein Firmware-Angebot.
+  char offer[160];
+  if (ok && firmwareOffer(payload, offer, sizeof(offer))) {
+    resp.setContentFormat(OT_COAP_FORMAT_JSON);
+    resp.setPayload(offer);
+  }
   resp.send();
 }
 
@@ -249,7 +515,12 @@ void setup() {
   // High impedance switches the blue LED off whether it is wired active-high or active-low
   pinMode(BLUE_LED_PIN, INPUT);
 
-  // UART zum Raspberry Pi (JSON-Zeilen, 115200 baud)
+  g_fwLock = xSemaphoreCreateMutex();
+  g_piLock = xSemaphoreCreateMutex();
+  loadFirmwareMeta();
+
+  // UART zum Raspberry Pi (JSON-Zeilen, 115200 baud). Groesserer RX-Puffer fuer Firmware-Bloecke.
+  PI_SERIAL.setRxBufferSize(4096);
   PI_SERIAL.begin(PI_BAUD, SERIAL_8N1, PI_RX_PIN, PI_TX_PIN);
   delay(100);
   sendEventToPi("ESP-ThreadReceiver boot");
@@ -260,8 +531,9 @@ void setup() {
 
   // CoAP-Server: hier liefern die Sensoren ab.
   OThreadCoAPServer.on(INGEST_PATH, OT_COAP_METHOD_POST, handleIngest, nullptr);
+  OThreadCoAPServer.on(FW_PATH, OT_COAP_METHOD_POST, handleFw, nullptr);
   OThreadCoAPServer.begin();
-  CONSOLE.printf("CoAP-Server bereit: POST /%s\n", INGEST_PATH);
+  CONSOLE.printf("CoAP-Server bereit: POST /%s, POST /%s\n", INGEST_PATH, FW_PATH);
 
   // Beim Start ein Anmeldefenster oeffnen, damit neue Sensoren ohne
   // Zusatzhandgriff dazukommen koennen.
@@ -293,15 +565,15 @@ void loop() {
     }
   }
 
-  // Alles, was vom Pi kommt, auf der Konsole zeigen (Verdrahtungs-Check:
-  // auf dem Pi z. B. `echo ping > /dev/serial0`).
-  static char piLine[128];
+  // Zeilen vom Pi: Firmware-Befehle ("FW ..."), alles andere nur auf der
+  // Konsole zeigen (Verdrahtungs-Check: auf dem Pi z. B. `echo ping > /dev/serial0`).
+  static char piLine[1100];
   static size_t piLen = 0;
   while (PI_SERIAL.available()) {
     int c = PI_SERIAL.read();
     if (c == '\n' || piLen == sizeof(piLine) - 1) {
       piLine[piLen] = '\0';
-      CONSOLE.printf("PI   %s\n", piLine);
+      if (piLen) handlePiCommand(piLine);
       piLen = 0;
     } else if (c != '\r') {
       piLine[piLen++] = (char)c;
