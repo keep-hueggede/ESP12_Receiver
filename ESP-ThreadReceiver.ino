@@ -73,6 +73,9 @@ static HWCDC USBConsole;          // USB-Serial/JTAG selbst instanziieren
 //   C6 Pad "TX" / GPIO16  -> Pi GPIO15 (RXD, pin 10)
 //   C6 Pad "RX" / GPIO17  <- Pi GPIO14 (TXD, pin 8)
 //   C6 GND                -> Pi GND (z. B. pin 6)
+// Alternativ (empfohlen): C6 per USB am Pi, dort /dev/ttyACM0. Die JSON-Zeilen
+// und "FW ..."-Befehle laufen dann ueber die Konsole; der Collector ignoriert
+// alle Zeilen, die nicht mit '{' beginnen. Konsolenbefehle dann mit Enter.
 #define PI_SERIAL    Serial0
 #define PI_BAUD      115200
 #define PI_TX_PIN    16     // Pad "TX", GPIO16 -> Pi RXD
@@ -159,11 +162,14 @@ static uint32_t g_rejected = 0;   // verworfene Nutzlasten
 // Feld "src". Es wird unveraendert als eine Zeile durchgereicht - der Parser
 // auf dem Pi sieht dasselbe Format wie bisher.
 // --------------------------------------------------------------------------
-// Lines come from the OpenThread task and from loop(): write each one in one piece
+// Lines come from the OpenThread task and from loop(): write each one in one piece.
+// The Pi may be wired to the UART pins or plugged into USB, so both get every line.
 static void sendToPi(const char *json) {
   xSemaphoreTake(g_piLock, portMAX_DELAY);
   PI_SERIAL.write((const uint8_t *)json, strlen(json));
   PI_SERIAL.write('\n');
+  CONSOLE.write((const uint8_t *)json, strlen(json));
+  CONSOLE.write('\n');
   xSemaphoreGive(g_piLock);
 }
 
@@ -500,8 +506,25 @@ static bool openCommissioning() {
 #endif
 }
 
+// Collects bytes into lines; returns the finished, non-empty line or nullptr
+struct LineReader {
+  char buf[1100];
+  size_t len = 0;
+  char *feed(int c) {
+    if (c == '\n' || len == sizeof(buf) - 1) {
+      buf[len] = '\0';
+      bool done = len > 0;
+      len = 0;
+      return done ? buf : nullptr;
+    }
+    if (c != '\r') buf[len++] = (char)c;
+    return nullptr;
+  }
+};
+
 // --------------------------------------------------------------------------
 void setup() {
+  CONSOLE.setRxBufferSize(4096);   // firmware blocks from the Pi when it is plugged into USB
   CONSOLE.begin(115200);
   // Auf den Host warten, aber nicht ewig: ohne offenen Monitor laeuft es weiter.
   while (!CONSOLE && millis() < 5000) {
@@ -539,7 +562,7 @@ void setup() {
   // Zusatzhandgriff dazukommen koennen.
   openCommissioning();
 
-  CONSOLE.println("Bereit. Taste 'c' oeffnet ein neues Anmeldefenster, 's' zeigt den Status.");
+  CONSOLE.println("Bereit. 'c' + Enter oeffnet ein neues Anmeldefenster, 's' + Enter zeigt den Status.");
 }
 
 // --------------------------------------------------------------------------
@@ -554,12 +577,16 @@ void loop() {
     CONSOLE.printf("Rolle: %s\n", role);
   }
 
-  // Konsolen-Kommandos
+  // USB: Pi protocol ("FW ...") and console commands 'c' / 's', one per line
+  static LineReader usb;
   while (CONSOLE.available()) {
-    int c = CONSOLE.read();
-    if (c == 'c' || c == 'C') {
+    char *line = usb.feed(CONSOLE.read());
+    if (!line) continue;
+    if (strncmp(line, "FW ", 3) == 0) {
+      handlePiCommand(line);
+    } else if (strcasecmp(line, "c") == 0) {
       openCommissioning();
-    } else if (c == 's' || c == 'S') {
+    } else if (strcasecmp(line, "s") == 0) {
       CONSOLE.printf("Status: Rolle=%s RLOC16=0x%04X empfangen=%lu verworfen=%lu Laufzeit=%lus\n",
                      role, OThread.getRloc16(), (unsigned long)g_received, (unsigned long)g_rejected, (unsigned long)(millis() / 1000));
     }
@@ -567,17 +594,10 @@ void loop() {
 
   // Zeilen vom Pi: Firmware-Befehle ("FW ..."), alles andere nur auf der
   // Konsole zeigen (Verdrahtungs-Check: auf dem Pi z. B. `echo ping > /dev/serial0`).
-  static char piLine[1100];
-  static size_t piLen = 0;
+  static LineReader uart;
   while (PI_SERIAL.available()) {
-    int c = PI_SERIAL.read();
-    if (c == '\n' || piLen == sizeof(piLine) - 1) {
-      piLine[piLen] = '\0';
-      if (piLen) handlePiCommand(piLine);
-      piLen = 0;
-    } else if (c != '\r') {
-      piLine[piLen++] = (char)c;
-    }
+    char *line = uart.feed(PI_SERIAL.read());
+    if (line) handlePiCommand(line);
   }
 
   // Lebenszeichen alle 60 s, damit im Log sichtbar bleibt, dass der Collector
